@@ -60,11 +60,15 @@ def make_config(experiment, data_path=None, quick_test=False):
 
 def download_data(data_path):
     from data.download_movielens import download_movielens_32m, verify_files
-    ml_dir = os.path.join(data_path, "ml-32m")
-    if verify_files(ml_dir):
-        print(f"Dataset already present at {ml_dir}")
+    # data_path is already the ml-32m directory (e.g. ./data/ml-32m/).
+    # The zip contains a ml-32m/ subfolder, so we must extract to the *parent*
+    # directory so the files land at data_path/ratings.csv (not a double-nested
+    # data_path/ml-32m/ratings.csv).
+    if verify_files(data_path):
+        print(f"Dataset already present at {data_path}")
     else:
-        download_movielens_32m(data_path)
+        parent_dir = os.path.dirname(os.path.normpath(data_path))
+        download_movielens_32m(parent_dir)
 
 
 def preprocess(cfg):
