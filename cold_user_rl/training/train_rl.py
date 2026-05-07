@@ -277,6 +277,11 @@ def _quick_eval(agent, env, mf_model, finetuner, eval_cold_split,
     n_users = min(n_users, len(eval_users))
     sampled_users = np.random.choice(eval_users, size=n_users, replace=False)
 
+    # The training env only knows train_cold_split users; swap in eval_cold_split
+    # so env.reset(user_id=uid) can find eval users, then restore afterwards.
+    _orig_split = env.cold_split
+    env.cold_split = eval_cold_split
+
     rmse_list = []
     for uid in sampled_users:
         if use_recurrent:
@@ -301,6 +306,8 @@ def _quick_eval(agent, env, mf_model, finetuner, eval_cold_split,
             state_norm = (next_state - running_mean) / (np.sqrt(running_var) + 1e-8)
 
         rmse_list.append(info.get("rmse", float("nan")))
+
+    env.cold_split = _orig_split  # restore training split
 
     rmse_arr = np.array([r for r in rmse_list if not np.isnan(r)])
     return {
