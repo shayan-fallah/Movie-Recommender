@@ -286,8 +286,7 @@ def _quick_eval(agent, env, mf_model, finetuner, eval_cold_split,
     for uid in sampled_users:
         if use_recurrent:
             agent.reset_hidden()
-        env.reset(user_id=uid)
-        state = env._get_state()
+        state = env.reset(user_id=uid)
         state_norm = (state - running_mean) / (np.sqrt(running_var) + 1e-8)
 
         done = False
