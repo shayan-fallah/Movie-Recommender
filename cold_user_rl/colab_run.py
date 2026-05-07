@@ -10,13 +10,14 @@ Available experiments: base, module1, module2, module3, module4, full
 
 Optional flags:
     --quick_test        Use small episode/user counts for smoke testing
-    --data_path PATH    Override data directory (default: ./data/ml-32m/)
+    --data_path PATH    Override data directory (absolute path to ml-32m/)
     --download          Download MovieLens 32M before running
     --preprocess_only   Only run preprocessing then exit
 """
 import argparse
 import copy
 import os
+import shutil
 import sys
 
 # Make sure imports work regardless of how the script is invoked
@@ -31,7 +32,7 @@ def make_config(experiment, data_path=None, quick_test=False):
     cfg = copy.deepcopy(CONFIG)
 
     if data_path:
-        cfg["data_path"] = data_path
+        cfg["data_path"] = os.path.abspath(data_path)
 
     if quick_test:
         cfg["quick_test"] = True
@@ -60,15 +61,32 @@ def make_config(experiment, data_path=None, quick_test=False):
 
 def download_data(data_path):
     from data.download_movielens import download_movielens_32m, verify_files
-    # data_path is already the ml-32m directory (e.g. ./data/ml-32m/).
-    # The zip contains a ml-32m/ subfolder, so we must extract to the *parent*
-    # directory so the files land at data_path/ratings.csv (not a double-nested
-    # data_path/ml-32m/ratings.csv).
+
+    data_path = os.path.abspath(data_path)
+
+    # ── Case 1: already at the correct location ────────────────────────────────
     if verify_files(data_path):
         print(f"Dataset already present at {data_path}")
-    else:
-        parent_dir = os.path.dirname(os.path.normpath(data_path))
-        download_movielens_32m(parent_dir)
+        return
+
+    # ── Case 2: double-nested layout from old bug (data_path/ml-32m/ratings.csv)
+    nested = os.path.join(data_path, "ml-32m")
+    if verify_files(nested):
+        print(f"Found data nested at {nested} — moving files up to {data_path} ...")
+        os.makedirs(data_path, exist_ok=True)
+        for fname in os.listdir(nested):
+            shutil.move(os.path.join(nested, fname), os.path.join(data_path, fname))
+        try:
+            os.rmdir(nested)
+        except OSError:
+            pass  # non-empty remnants are harmless
+        print(f"Files moved. Dataset ready at {data_path}")
+        return
+
+    # ── Case 3: not downloaded yet — extract to parent so ml-32m/ lands correctly
+    parent_dir = os.path.dirname(data_path)
+    os.makedirs(parent_dir, exist_ok=True)
+    download_movielens_32m(parent_dir)
 
 
 def preprocess(cfg):
@@ -87,7 +105,7 @@ def main():
     parser.add_argument("--experiment", default="base",
                         choices=["base", "module1", "module2", "module3", "module4", "full"])
     parser.add_argument("--data_path", default=None,
-                        help="Path to the ml-32m/ parent directory")
+                        help="Absolute path to the ml-32m/ directory (overrides config default)")
     parser.add_argument("--download", action="store_true",
                         help="Download MovieLens 32M before running")
     parser.add_argument("--preprocess_only", action="store_true",

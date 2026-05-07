@@ -1,8 +1,14 @@
+import os
+
+# All paths are anchored to this file so they are correct regardless of the
+# current working directory (important for Google Colab and IDE runners).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
 CONFIG = {
 
     # ─── DATASET ───────────────────────────────────────────────────────────────
     "dataset": "movielens_32m",
-    "data_path": "./data/ml-32m/",
+    "data_path": os.path.join(_HERE, "data", "ml-32m"),
     "min_user_interactions": 20,
     "cold_user_fraction": 0.25,
     "min_cold_user_interactions": 15,
@@ -86,8 +92,8 @@ CONFIG = {
     "eval_k_values": [5, 10, 20],
     "num_eval_episodes": 200,
     "eval_every_n_episodes": 500,
-    "checkpoint_dir": "./checkpoints",
-    "log_dir": "./logs",
+    "checkpoint_dir": os.path.join(_HERE, "checkpoints"),
+    "log_dir": os.path.join(_HERE, "logs"),
 
     # ─── QUICK TEST (smoke testing without full dataset) ───────────────────────
     "quick_test": False,

@@ -280,12 +280,13 @@ def is_processed(data_dir):
     Checks for dataset_stats.json (written last), not just the directory.
     A partial/interrupted run leaves the directory but may not write this file.
     """
-    return os.path.isfile(os.path.join(data_dir, "dataset_stats.json"))
+    return os.path.isfile(os.path.join(os.path.abspath(data_dir), "dataset_stats.json"))
 
 
 def run_pipeline(config):
     """Full preprocessing pipeline driven by CONFIG dict."""
-    data_dir = config["data_path"]
+    data_dir = os.path.abspath(config["data_path"])
+    config = {**config, "data_path": data_dir}   # propagate absolute path downstream
     seed = config.get("random_seed", 42)
     normalize = config.get("normalize_ratings", True)
 
