@@ -7,6 +7,127 @@ import numpy as np
 import pandas as pd
 
 
+def _save_json(path, obj):
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+
+def build_kcore_subset(ratings_df, tags_df, config):
+    """Return a filtered subset via year filter + iterative k-core co-filtering + hard caps.
+
+    Steps:
+      1. (Optional) Drop movies released before config["min_year"] using movieId→year
+         extracted from the ml-32m movies.csv title field ("Movie Title (YYYY)").
+      2. Iteratively remove users with < min_user_ratings and items with < min_item_ratings
+         until the graph stops shrinking (up to kcore_iterations passes).
+      3. Enforce hard caps: sample max_users users and max_items items by rating count,
+         then keep only rows in the intersection.
+      4. Re-filter tags_df to the surviving (userId, movieId) pairs.
+
+    Returns (ratings_df_filtered, tags_df_filtered).
+    tags_df_filtered is None if tags_df was None.
+    """
+    if not config.get("use_subset", False):
+        return ratings_df, tags_df
+
+    min_u = config.get("min_user_ratings", 100)
+    min_i = config.get("min_item_ratings", 200)
+    max_iters = config.get("kcore_iterations", 10)
+    min_year = config.get("min_year", None)
+    max_users = config.get("max_users", None)
+    max_items = config.get("max_items", None)
+    rng_seed = config.get("subset_random_seed", 42)
+    data_dir = config.get("data_path", ".")
+
+    df = ratings_df.copy()
+
+    # ── Step 1: year filter ────────────────────────────────────────────────────
+    if min_year is not None:
+        movies_path = os.path.join(data_dir, "movies.csv")
+        if os.path.isfile(movies_path):
+            movies = pd.read_csv(movies_path, dtype={"movieId": int})
+            # Extract year from title like "Toy Story (1995)"
+            movies["year"] = movies["title"].str.extract(r'\((\d{4})\)$').astype(float)
+            keep_ids = movies.loc[movies["year"] >= min_year, "movieId"]
+            before = df["movieId"].nunique()
+            df = df[df["movieId"].isin(keep_ids)].reset_index(drop=True)
+            print(f"  Year filter (>={min_year}): {before:,} → {df['movieId'].nunique():,} items")
+        else:
+            print(f"  Warning: movies.csv not found at {movies_path}; skipping year filter")
+
+    # ── Step 2: iterative k-core ───────────────────────────────────────────────
+    for iteration in range(max_iters):
+        prev_len = len(df)
+        user_counts = df.groupby("userId").size()
+        df = df[df["userId"].isin(user_counts[user_counts >= min_u].index)]
+        item_counts = df.groupby("movieId").size()
+        df = df[df["movieId"].isin(item_counts[item_counts >= min_i].index)]
+        df = df.reset_index(drop=True)
+        if len(df) == prev_len:
+            print(f"  K-core converged after {iteration + 1} iteration(s): "
+                  f"{df['userId'].nunique():,} users, {df['movieId'].nunique():,} items, "
+                  f"{len(df):,} ratings")
+            break
+    else:
+        print(f"  K-core reached max iterations ({max_iters}): "
+              f"{df['userId'].nunique():,} users, {df['movieId'].nunique():,} items")
+
+    # ── Step 3: hard caps ──────────────────────────────────────────────────────
+    rng = np.random.default_rng(rng_seed)
+
+    if max_users is not None and df["userId"].nunique() > max_users:
+        user_rc = df.groupby("userId").size().sort_values(ascending=False)
+        keep_users = user_rc.index[:max_users]
+        df = df[df["userId"].isin(keep_users)].reset_index(drop=True)
+        print(f"  Hard cap: kept top-{max_users:,} users by rating count")
+
+    if max_items is not None and df["movieId"].nunique() > max_items:
+        item_rc = df.groupby("movieId").size().sort_values(ascending=False)
+        keep_items = item_rc.index[:max_items]
+        df = df[df["movieId"].isin(keep_items)].reset_index(drop=True)
+        print(f"  Hard cap: kept top-{max_items:,} items by rating count")
+
+    # ── Step 4: filter tags ────────────────────────────────────────────────────
+    tags_out = None
+    if tags_df is not None and len(tags_df) > 0:
+        surviving_users = set(df["userId"].unique())
+        surviving_items = set(df["movieId"].unique())
+        tags_out = tags_df[
+            tags_df["userId"].isin(surviving_users) &
+            tags_df["movieId"].isin(surviving_items)
+        ].reset_index(drop=True)
+
+    return df, tags_out
+
+
+def print_density_report(ratings_df, config):
+    """Print dataset density statistics after filtering."""
+    n_users = ratings_df["userId"].nunique()
+    n_items = ratings_df["movieId"].nunique()
+    n_ratings = len(ratings_df)
+    density = n_ratings / max(n_users * n_items, 1)
+    avg_per_user = n_ratings / max(n_users, 1)
+    avg_per_item = n_ratings / max(n_items, 1)
+
+    print("\n── Dataset density report ──────────────────────────────────────────")
+    print(f"  Users:             {n_users:>10,}")
+    print(f"  Items:             {n_items:>10,}")
+    print(f"  Ratings:           {n_ratings:>10,}")
+    print(f"  Density:           {density:>10.4%}")
+    print(f"  Avg ratings/user:  {avg_per_user:>10.1f}")
+    print(f"  Avg ratings/item:  {avg_per_item:>10.1f}")
+
+    min_cold = config.get("min_cold_user_interactions", 15)
+    if avg_per_user < min_cold * 2:
+        print(f"  WARNING: avg ratings/user ({avg_per_user:.1f}) is close to "
+              f"min_cold_user_interactions ({min_cold}). "
+              f"Consider lowering min_user_ratings or min_cold_user_interactions.")
+    if density < 0.001:
+        print(f"  WARNING: density ({density:.4%}) is very low. "
+              f"MF may struggle to learn useful embeddings.")
+    print("────────────────────────────────────────────────────────────────────\n")
+
+
 def load_raw_ratings(data_dir):
     path = os.path.join(data_dir, "ratings.csv")
     df = pd.read_csv(path, dtype={"userId": int, "movieId": int, "rating": float, "timestamp": int})
@@ -171,6 +292,18 @@ def run_pipeline(config):
     print("Loading raw ratings ...")
     df = load_raw_ratings(data_dir)
     print(f"  Raw: {len(df):,} ratings, {df['userId'].nunique():,} users, {df['movieId'].nunique():,} items")
+
+    # Load tags early so build_kcore_subset can filter them alongside ratings
+    tags_path = os.path.join(data_dir, "tags.csv")
+    if os.path.isfile(tags_path):
+        tags_raw = pd.read_csv(tags_path, dtype={"userId": int, "movieId": int})
+        tags_raw = tags_raw[["userId", "movieId"]].drop_duplicates()
+    else:
+        tags_raw = None
+
+    # Subsample via k-core filtering (no-op when use_subset=False)
+    df, tags_raw = build_kcore_subset(df, tags_raw, config)
+    print_density_report(df, config)
 
     df = filter_users(df, config["min_user_interactions"])
     print(f"  After filter (>={config['min_user_interactions']} ratings): {df['userId'].nunique():,} users")

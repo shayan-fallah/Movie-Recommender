@@ -10,6 +10,16 @@ CONFIG = {
     "train_val_test_split": [0.7, 0.1, 0.2],
     "random_seed": 42,
 
+    # ─── DATASET SUBSAMPLING ───────────────────────────────────────────────────
+    "use_subset": True,
+    "min_user_ratings": 100,
+    "min_item_ratings": 200,
+    "kcore_iterations": 10,
+    "min_year": 2000,
+    "max_users": 30000,
+    "max_items": 10000,
+    "subset_random_seed": 42,
+
     # ─── HYBRID FEEDBACK (MODULE 1) ────────────────────────────────────────────
     "use_hybrid_feedback": True,
     "explicit_weight": 0.7,
