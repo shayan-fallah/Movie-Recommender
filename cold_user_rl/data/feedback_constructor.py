@@ -1,3 +1,10 @@
+"""Feedback bundle construction for hybrid MF training.
+
+FeedbackBundle stores observations as flat arrays (NOT dense matrices).
+For MovieLens 32M, three dense 200K×84K matrices would require ~200 GB RAM;
+flat arrays for 32M observations require ~640 MB total.
+"""
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -7,98 +14,88 @@ import torch
 
 @dataclass
 class FeedbackBundle:
-    explicit: np.ndarray    # (n_users, n_items) float32, np.nan for missing
-    implicit: np.ndarray    # (n_users, n_items) float32, 0/1/nan
-    confidence: np.ndarray  # (n_users, n_items) float32, >= 1.0 for rated
-
-
-def build_explicit_matrix(df, n_users, n_items, normalize=True):
-    """E[u,i] = rating/5 if rated, else np.nan."""
-    mat = np.full((n_users, n_items), np.nan, dtype=np.float32)
-    for row in df.itertuples(index=False):
-        r = float(row.rating)
-        if normalize:
-            r /= 5.0
-        mat[int(row.userId), int(row.movieId)] = r
-    return mat
-
-
-def build_implicit_matrix(df, threshold, n_users, n_items):
-    """I[u,i] = 1 if rating >= threshold, 0 if rated below threshold, np.nan if never rated."""
-    mat = np.full((n_users, n_items), np.nan, dtype=np.float32)
-    for row in df.itertuples(index=False):
-        mat[int(row.userId), int(row.movieId)] = 1.0 if float(row.rating) >= threshold else 0.0
-    return mat
-
-
-def build_confidence_matrix(df, tags_df, n_users, n_items, tag_bonus=0.2):
-    """C[u,i] = 1.0 base for all rated items, + tag_bonus if user also tagged the movie."""
-    mat = np.zeros((n_users, n_items), dtype=np.float32)
-    for row in df.itertuples(index=False):
-        mat[int(row.userId), int(row.movieId)] = 1.0
-
-    if tags_df is not None and len(tags_df) > 0:
-        for row in tags_df.itertuples(index=False):
-            uid = int(row.userId)
-            mid = int(row.movieId)
-            if uid < n_users and mid < n_items and mat[uid, mid] > 0:
-                mat[uid, mid] += tag_bonus
-
-    return mat
-
-
-def compute_hybrid_loss(predictions, explicit_targets, implicit_targets,
-                        confidence, lambda_e, lambda_i):
-    """
-    Hybrid MF loss combining explicit and implicit feedback.
-
-    Args:
-        predictions: (N,) predicted scores for observed (user, item) pairs
-        explicit_targets: (N,) explicit ratings (NaN for pairs with no explicit rating)
-        implicit_targets: (N,) binary implicit labels (NaN for unobserved)
-        confidence: (N,) confidence weights for implicit term
-        lambda_e: weight for explicit loss term
-        lambda_i: weight for implicit loss term
-
-    Returns:
-        Scalar loss tensor
-    """
-    loss = torch.tensor(0.0, requires_grad=True)
-
-    # Explicit term — only observed explicit ratings
-    explicit_mask = ~torch.isnan(explicit_targets)
-    if explicit_mask.any():
-        diff_e = predictions[explicit_mask] - explicit_targets[explicit_mask]
-        explicit_loss = (diff_e ** 2).mean()
-        loss = loss + lambda_e * explicit_loss
-
-    # Implicit term — confidence-weighted, only where implicit label is known
-    implicit_mask = ~torch.isnan(implicit_targets)
-    if implicit_mask.any():
-        diff_i = predictions[implicit_mask] - implicit_targets[implicit_mask]
-        conf = confidence[implicit_mask]
-        implicit_loss = (conf * diff_i ** 2).mean()
-        loss = loss + lambda_i * implicit_loss
-
-    return loss
+    """Observation-pair arrays for all rated (user, item) pairs in the training set."""
+    user_ids: np.ndarray    # (N,) int64
+    item_ids: np.ndarray    # (N,) int64
+    explicit: np.ndarray    # (N,) float32 — normalized ratings in [0, 1]
+    implicit: np.ndarray    # (N,) float32 — binary 0/1 (rating >= threshold → 1)
+    confidence: np.ndarray  # (N,) float32 — >= 1.0; higher for tagged items
 
 
 def build_feedback_bundle(train_df, tags_df, n_users, n_items, config):
-    """Construct FeedbackBundle from training dataframe and config."""
+    """Build FeedbackBundle from training DataFrame.
+
+    Args:
+        train_df: DataFrame with columns [userId, movieId, rating]
+                  Ratings must already be normalized to [0, 1] (as saved by preprocess.py).
+        tags_df:  DataFrame with columns [userId, movieId] or None.
+        n_users, n_items: dataset dimensions (for bounds checking only).
+        config:   CONFIG dict.
+
+    Returns:
+        FeedbackBundle
+    """
     normalize = config.get("normalize_ratings", True)
     threshold = config.get("implicit_threshold", 3.5)
     tag_bonus = config.get("tag_confidence_bonus", 0.2)
 
-    explicit = build_explicit_matrix(train_df, n_users, n_items, normalize)
-    implicit = build_implicit_matrix(train_df, threshold, n_users, n_items)
-    confidence = build_confidence_matrix(train_df, tags_df, n_users, n_items, tag_bonus)
+    # Ratings in train_df are already normalized by preprocess.py
+    # Adjust threshold to the same scale
+    thr = threshold / 5.0 if normalize else threshold
 
-    return FeedbackBundle(explicit=explicit, implicit=implicit, confidence=confidence)
+    user_ids = train_df["userId"].values.astype(np.int64)
+    item_ids = train_df["movieId"].values.astype(np.float64)  # temp float for map
+    # Ensure integer after any float conversion from parquet
+    item_ids = train_df["movieId"].values.astype(np.int64)
+    ratings = train_df["rating"].values.astype(np.float32)
+
+    implicit = (ratings >= thr).astype(np.float32)
+
+    confidence = np.ones(len(ratings), dtype=np.float32)
+    if tags_df is not None and len(tags_df) > 0:
+        # Build a set of (userId, movieId) pairs that have tags
+        tagged = set(zip(tags_df["userId"].values, tags_df["movieId"].values))
+        for i in range(len(user_ids)):
+            if (int(user_ids[i]), int(item_ids[i])) in tagged:
+                confidence[i] += tag_bonus
+
+    return FeedbackBundle(
+        user_ids=user_ids,
+        item_ids=item_ids,
+        explicit=ratings,
+        implicit=implicit,
+        confidence=confidence,
+    )
+
+
+def compute_hybrid_loss(predictions, explicit_targets, implicit_targets,
+                        confidence, lambda_e, lambda_i):
+    """Hybrid MF loss combining explicit and implicit feedback.
+
+    All inputs are (N,) tensors for the observed batch.
+
+    Args:
+        predictions:      (N,) predicted scores
+        explicit_targets: (N,) explicit normalized ratings
+        implicit_targets: (N,) binary 0/1 implicit labels
+        confidence:       (N,) confidence weights
+        lambda_e:         weight for explicit loss term
+        lambda_i:         weight for implicit loss term
+
+    Returns:
+        Scalar loss tensor
+    """
+    diff_e = predictions - explicit_targets
+    explicit_loss = (diff_e ** 2).mean()
+
+    diff_i = predictions - implicit_targets
+    implicit_loss = (confidence * diff_i ** 2).mean()
+
+    return lambda_e * explicit_loss + lambda_i * implicit_loss
 
 
 def load_tags(data_dir, user_map, item_map):
-    """Load tags.csv and remap IDs. Returns None if tags.csv not present."""
-    import os
+    """Load tags.csv and remap IDs. Returns None if file not present."""
     path = os.path.join(data_dir, "tags.csv")
     if not os.path.isfile(path):
         return None
@@ -106,4 +103,4 @@ def load_tags(data_dir, user_map, item_map):
     tags = tags[tags["userId"].isin(user_map) & tags["movieId"].isin(item_map)].copy()
     tags["userId"] = tags["userId"].map(user_map)
     tags["movieId"] = tags["movieId"].map(item_map)
-    return tags
+    return tags[["userId", "movieId"]]

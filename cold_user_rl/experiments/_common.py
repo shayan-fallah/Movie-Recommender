@@ -20,7 +20,7 @@ def setup_experiment(config, experiment_name):
     from evaluation.evaluate import (
         evaluate_cold_users, compare_no_interview_baseline, generate_full_report
     )
-    from data.preprocess import load_processed
+    from data.preprocess import load_processed, is_processed, run_pipeline
     from data.feedback_constructor import build_feedback_bundle, load_tags
     from models.matrix_factorization import MatrixFactorization, ColdUserFinetuner
     from utils.logger import ExperimentLogger
@@ -37,9 +37,12 @@ def setup_experiment(config, experiment_name):
 
     # ── Data ─────────────────────────────────────────────────────────────────
     processed_dir = os.path.join(config["data_path"], "processed")
-    if not os.path.isdir(processed_dir):
-        logger.info("Processed data not found — running preprocessing pipeline ...")
-        from data.preprocess import run_pipeline
+
+    # Check for dataset_stats.json (the sentinel written LAST by save_processed).
+    # Checking only os.path.isdir() is wrong — an interrupted run creates the
+    # directory before saving any files, causing a silent failure on reload.
+    if not is_processed(processed_dir):
+        logger.info("Processed data not found (or incomplete) — running preprocessing pipeline ...")
         run_pipeline(config)
 
     data = load_processed(processed_dir)
@@ -48,14 +51,9 @@ def setup_experiment(config, experiment_name):
     n_items = stats["n_items"]
     logger.info(f"Dataset: {n_users:,} users, {n_items:,} items")
 
+    # train_df comes directly from load_processed (parquet, not a dense matrix)
+    train_df = data["train_df"]
     tags_df = load_tags(config["data_path"], data["user_map"], data["item_map"])
-
-    # Rebuild training dataframe for feedback bundle
-    import pandas as pd
-    train_mat = data["train_ratings"]
-    u_ids, i_ids = np.where(~np.isnan(train_mat))
-    ratings = train_mat[u_ids, i_ids]
-    train_df = pd.DataFrame({"userId": u_ids, "movieId": i_ids, "rating": ratings})
 
     feedback_bundle = build_feedback_bundle(train_df, tags_df, n_users, n_items, config)
 
@@ -71,7 +69,8 @@ def setup_experiment(config, experiment_name):
     # ── Action Pool ───────────────────────────────────────────────────────────
     # Top-N most popular items (by rating count in training data)
     pool_size = config.get("action_pool_size", 200)
-    item_counts = np.bincount(i_ids.astype(np.int64), minlength=n_items)
+    i_ids = train_df["movieId"].values.astype(np.int64)
+    item_counts = np.bincount(i_ids, minlength=n_items)
     action_pool = np.argsort(-item_counts)[:pool_size].astype(np.int64)
 
     # ── Item metadata ─────────────────────────────────────────────────────────
@@ -100,7 +99,6 @@ def setup_experiment(config, experiment_name):
 
     # ── Final Evaluation ──────────────────────────────────────────────────────
     finetuner = ColdUserFinetuner(mf_model, config)
-    # Rebuild env for evaluation
     from training.train_rl import build_env
     eval_env = build_env(
         mf_model, finetuner, feedback_bundle, eval_cold_split,

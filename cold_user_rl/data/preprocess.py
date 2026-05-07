@@ -88,28 +88,27 @@ def temporal_split(warm_df, val_frac, test_frac):
     return train, val, test
 
 
-def build_rating_matrix(df, n_users, n_items, normalize=True):
-    """Build dense float32 rating matrix with np.nan for missing entries."""
-    mat = np.full((n_users, n_items), np.nan, dtype=np.float32)
-    for row in df.itertuples(index=False):
-        r = float(row.rating)
-        if normalize:
-            r = r / 5.0
-        mat[int(row.userId), int(row.movieId)] = r
-    return mat
-
-
 def save_processed(output_dir, train_df, val_df, test_df,
                    warm_user_ids, cold_split_dict,
                    user_map, item_map, n_users, n_items,
                    normalize=True):
+    """Save processed data using parquet (memory-efficient for large datasets).
+
+    Dense numpy matrices are NOT used — a 200K×84K float matrix is ~67 GB.
+    DataFrames are stored as parquet files; cold_split as pickle.
+    """
     os.makedirs(output_dir, exist_ok=True)
 
-    train_mat = build_rating_matrix(train_df, n_users, n_items, normalize)
-    val_mat = build_rating_matrix(val_df, n_users, n_items, normalize)
+    # Normalize ratings before saving so everything downstream uses [0,1] scale
+    def _maybe_norm(df):
+        if normalize:
+            df = df.copy()
+            df["rating"] = df["rating"] / 5.0
+        return df
 
-    np.save(os.path.join(output_dir, "train_ratings.npy"), train_mat)
-    np.save(os.path.join(output_dir, "val_ratings.npy"), val_mat)
+    _maybe_norm(train_df).to_parquet(os.path.join(output_dir, "train.parquet"), index=False)
+    _maybe_norm(val_df).to_parquet(os.path.join(output_dir, "val.parquet"), index=False)
+
     np.save(os.path.join(output_dir, "warm_user_ids.npy"), np.array(warm_user_ids))
 
     with open(os.path.join(output_dir, "user_map.pkl"), "wb") as f:
@@ -124,10 +123,11 @@ def save_processed(output_dir, train_df, val_df, test_df,
         "n_items": n_items,
         "n_warm_users": len(warm_user_ids),
         "n_cold_users": len(cold_split_dict),
-        "n_train_ratings": int(np.sum(~np.isnan(train_mat))),
-        "n_val_ratings": int(np.sum(~np.isnan(val_mat))),
+        "n_train_ratings": len(train_df),
+        "n_val_ratings": len(val_df),
         "normalized": normalize,
     }
+    # dataset_stats.json is the sentinel file checked to detect complete preprocessing
     with open(os.path.join(output_dir, "dataset_stats.json"), "w") as f:
         json.dump(stats, f, indent=2)
 
@@ -137,8 +137,8 @@ def save_processed(output_dir, train_df, val_df, test_df,
 
 def load_processed(data_dir):
     result = {}
-    result["train_ratings"] = np.load(os.path.join(data_dir, "train_ratings.npy"), allow_pickle=False)
-    result["val_ratings"] = np.load(os.path.join(data_dir, "val_ratings.npy"), allow_pickle=False)
+    result["train_df"] = pd.read_parquet(os.path.join(data_dir, "train.parquet"))
+    result["val_df"] = pd.read_parquet(os.path.join(data_dir, "val.parquet"))
     result["warm_user_ids"] = np.load(os.path.join(data_dir, "warm_user_ids.npy"), allow_pickle=False)
 
     with open(os.path.join(data_dir, "user_map.pkl"), "rb") as f:
@@ -151,6 +151,15 @@ def load_processed(data_dir):
         result["stats"] = json.load(f)
 
     return result
+
+
+def is_processed(data_dir):
+    """Return True only when preprocessing completed successfully.
+
+    Checks for dataset_stats.json (written last), not just the directory.
+    A partial/interrupted run leaves the directory but may not write this file.
+    """
+    return os.path.isfile(os.path.join(data_dir, "dataset_stats.json"))
 
 
 def run_pipeline(config):

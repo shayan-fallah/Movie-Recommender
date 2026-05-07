@@ -18,12 +18,9 @@ def set_all_seeds(seed):
     torch.use_deterministic_algorithms(True, warn_only=True)
 
 
-def _make_obs_pairs(rating_matrix):
-    """Return arrays of (user_ids, item_ids, ratings) for observed entries."""
-    mask = ~np.isnan(rating_matrix)
-    user_ids, item_ids = np.where(mask)
-    ratings = rating_matrix[user_ids, item_ids].astype(np.float32)
-    return user_ids.astype(np.int64), item_ids.astype(np.int64), ratings
+def _make_obs_pairs(feedback_bundle):
+    """Return (user_ids, item_ids, ratings) arrays from FeedbackBundle."""
+    return feedback_bundle.user_ids, feedback_bundle.item_ids, feedback_bundle.explicit
 
 
 def train_mf(mf_model, feedback_bundle, config, logger):
@@ -49,11 +46,9 @@ def train_mf(mf_model, feedback_bundle, config, logger):
     optimizer = torch.optim.Adam(mf_model.parameters(), lr=lr, weight_decay=0.0)
     mf_model.train()
 
-    explicit = feedback_bundle.explicit
+    user_ids, item_ids, ratings = _make_obs_pairs(feedback_bundle)
     implicit = feedback_bundle.implicit
     confidence = feedback_bundle.confidence
-
-    user_ids, item_ids, ratings = _make_obs_pairs(explicit)
     n_obs = len(user_ids)
 
     logger.info(f"Training MF: {n_obs:,} observations, {n_iter} iterations, "
@@ -77,16 +72,9 @@ def train_mf(mf_model, feedback_bundle, config, logger):
             preds = mf_model(u_t, i_t)
 
             if use_hybrid:
-                # Gather implicit and confidence for this batch
-                imp_vals = implicit[user_ids[idx], item_ids[idx]]
-                conf_vals = confidence[user_ids[idx], item_ids[idx]]
-                imp_t = torch.FloatTensor(np.where(np.isnan(imp_vals), 0.0, imp_vals))
-                # Explicit targets: use actual ratings (not NaN here since we sampled obs pairs)
-                loss = compute_hybrid_loss(
-                    preds, r_t, imp_t,
-                    torch.FloatTensor(conf_vals),
-                    lam_e, lam_i
-                )
+                imp_t = torch.FloatTensor(implicit[idx])
+                conf_t = torch.FloatTensor(confidence[idx])
+                loss = compute_hybrid_loss(preds, r_t, imp_t, conf_t, lam_e, lam_i)
             else:
                 loss = nn.functional.mse_loss(preds, r_t)
 
@@ -119,15 +107,14 @@ def train_mf(mf_model, feedback_bundle, config, logger):
     return mf_model
 
 
-def evaluate_mf_val(mf_model, val_matrix, config):
-    """RMSE on validation set (observed entries only)."""
+def evaluate_mf_val(mf_model, val_df, config):
+    """RMSE on validation set."""
     mf_model.eval()
-    user_ids, item_ids, ratings = _make_obs_pairs(val_matrix)
-    if len(user_ids) == 0:
+    if len(val_df) == 0:
         return float("inf")
-    u_t = torch.LongTensor(user_ids)
-    i_t = torch.LongTensor(item_ids)
-    r_t = torch.FloatTensor(ratings)
+    u_t = torch.LongTensor(val_df["userId"].values)
+    i_t = torch.LongTensor(val_df["movieId"].values)
+    r_t = torch.FloatTensor(val_df["rating"].values.astype(np.float32))
     with torch.no_grad():
         preds = mf_model(u_t, i_t)
     rmse = float(torch.sqrt(nn.functional.mse_loss(preds, r_t)).item())
