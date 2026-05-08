@@ -321,6 +321,14 @@ def run_pipeline(config):
     )
     print(f"  Warm users: {warm_df['userId'].nunique():,} | Cold users: {cold_df['userId'].nunique():,}")
 
+    # Normalize cold user ratings to the same [0,1] scale as warm user training data.
+    # save_processed() normalizes warm train/val DataFrames via _maybe_norm(), but
+    # cold_split_dict is built here from the still-raw cold_df — without this fix,
+    # cold interview_pool and test_set ratings stay in [0.5, 5.0] while MF predictions
+    # are in [0,1], causing RMSE ~3.2 from scale mismatch alone.
+    if normalize:
+        cold_df = cold_df.copy()
+        cold_df["rating"] = cold_df["rating"] / 5.0
     cold_split_dict = split_cold_user_data(cold_df, seed)
     warm_user_ids = warm_df["userId"].unique().tolist()
 
