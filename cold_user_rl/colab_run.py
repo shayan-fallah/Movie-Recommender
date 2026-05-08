@@ -89,9 +89,15 @@ def download_data(data_path):
     download_movielens_32m(parent_dir)
 
 
-def preprocess(cfg):
+def preprocess(cfg, force=False):
     from data.preprocess import is_processed, run_pipeline
     processed_dir = os.path.join(cfg["data_path"], "processed")
+    if force:
+        # Remove the sentinel so run_pipeline executes unconditionally
+        sentinel = os.path.join(processed_dir, "dataset_stats.json")
+        if os.path.isfile(sentinel):
+            os.remove(sentinel)
+            print(f"Removed stale sentinel: {sentinel}")
     if is_processed(processed_dir):
         print(f"Processed data already exists at {processed_dir} — skipping.")
     else:
@@ -110,6 +116,9 @@ def main():
                         help="Download MovieLens 32M before running")
     parser.add_argument("--preprocess_only", action="store_true",
                         help="Only run preprocessing, then exit")
+    parser.add_argument("--force_preprocess", action="store_true",
+                        help="Force re-preprocessing even if processed data already exists "
+                             "(deletes the sentinel file and reruns the full pipeline)")
     parser.add_argument("--quick_test", action="store_true",
                         help="Short run for smoke testing (100 episodes, 20 users)")
     args = parser.parse_args()
@@ -119,7 +128,7 @@ def main():
     if args.download:
         download_data(cfg["data_path"])
 
-    preprocess(cfg)
+    preprocess(cfg, force=args.force_preprocess)
 
     if args.preprocess_only:
         print("Preprocessing done. Exiting (--preprocess_only).")
