@@ -40,8 +40,8 @@ CONFIG = {
     "mf_regularization": 0.01,
     "mf_iterations": 100,
     "freeze_warm_mf": True,
-    "cold_vector_lr": 0.01,
-    "cold_vector_steps": 50,
+    "cold_vector_lr": 0.001,
+    "cold_vector_steps": 200,
     "cold_init_top_k_similar": 5,
 
     # ─── RL / DQN ──────────────────────────────────────────────────────────────

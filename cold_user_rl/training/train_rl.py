@@ -10,7 +10,42 @@ from environment.cold_user_env_extended import ColdUserEnvExtended
 from models.dqn_base import DQNAgent
 from models.dqn_recurrent import DRQNAgent
 from models.hierarchical_rl import HierarchicalRLAgent
-from training.replay_buffer import UnifiedReplayBuffer
+from training.replay_buffer import PrioritizedReplayBuffer, UnifiedReplayBuffer
+
+
+class RunningNormalizer:
+    """Normalizes values using a running window mean and std.
+
+    Keeps the last `window` values and z-scores the incoming value.
+    Returns the raw value unchanged until at least 10 samples are collected.
+    """
+
+    def __init__(self, window=500):
+        self.values = []
+        self.window = window
+
+    def normalize(self, value):
+        self.values.append(value)
+        if len(self.values) > self.window:
+            self.values.pop(0)
+        if len(self.values) < 10:
+            return value
+        mean = np.mean(self.values)
+        std = np.std(self.values) + 1e-8
+        return (value - mean) / std
+
+
+def _make_per_buffer(config):
+    """Create a PrioritizedReplayBuffer with standard PER hyperparameters."""
+    capacity = config["buffer_size"]
+    return PrioritizedReplayBuffer(
+        capacity=capacity,
+        alpha=0.6,
+        beta_start=0.4,
+        beta_end=1.0,
+        beta_anneal_steps=capacity,
+        per_epsilon=1e-6,
+    )
 
 
 def build_env(mf_model, finetuner, feedback_bundle, cold_split,
@@ -56,7 +91,6 @@ def compute_epsilon(step, config):
     decay = config.get("epsilon_decay", 0.00046)
     eps_start = config.get("epsilon_start", 1.0)
     eps_end = config.get("epsilon_end", 0.01)
-    # Decay steps derived from epsilon_decay (rate per step)
     eps = eps_start - decay * step
     return float(max(eps_end, eps))
 
@@ -90,22 +124,15 @@ def train_rl(mf_model, feedback_bundle, cold_split, action_pool,
     env = build_env(mf_model, finetuner, feedback_bundle, cold_split,
                     action_pool, item_metadata, config)
 
-    # Inject action_pool into item_metadata so HierRL can map pool-idx → item-id
     item_metadata["action_pool"] = action_pool
-    if isinstance(env, ColdUserEnvExtended) and config.get("use_hierarchical_rl", False):
-        # Inject metadata into Hierarchical agent after creation
-        pass  # done below after agent creation
 
     state_dim = env.state_dim
     action_dim = len(action_pool)
 
     agent = build_agent(state_dim, action_dim, config)
 
-    # Inject item_metadata into HierRL agent
     if isinstance(agent, HierarchicalRLAgent):
         agent.set_item_metadata(item_metadata)
-
-    buffer = UnifiedReplayBuffer(config)
 
     use_recurrent = config.get("use_recurrent_dqn", False)
     use_hier = config.get("use_hierarchical_rl", False)
@@ -122,6 +149,24 @@ def train_rl(mf_model, feedback_bundle, cold_split, action_pool,
 
     interview_sizes = config.get("interview_sizes", [10])
 
+    # ── Replay buffers ────────────────────────────────────────────────────────
+    # Separate PER buffer per interview size for standard DQN so that
+    # transitions from 10-item and 100-item interviews never mix gradients.
+    # DRQN uses a single episode buffer (sequences are naturally per-size).
+    # HierRL manages its own internal worker/manager buffers.
+    if use_recurrent:
+        buffer = UnifiedReplayBuffer(config)  # single episode buffer
+        replay_buffers = None
+    elif use_hier:
+        buffer = None
+        replay_buffers = None
+    else:
+        buffer = None
+        replay_buffers = {s: _make_per_buffer(config) for s in interview_sizes}
+
+    # One reward normalizer per interview size
+    reward_normalizers = {s: RunningNormalizer(window=500) for s in interview_sizes}
+
     # Running statistics for state normalization
     running_mean = np.zeros(state_dim, dtype=np.float32)
     running_var = np.ones(state_dim, dtype=np.float32)
@@ -130,11 +175,9 @@ def train_rl(mf_model, feedback_bundle, cold_split, action_pool,
     best_eval_rmse = float("inf")
 
     for episode in trange(1, n_episodes + 1, desc="RL Training"):
-        # Pick interview size (cycle or use first)
         interview_size = interview_sizes[episode % len(interview_sizes)]
         env.set_interview_size(interview_size)
 
-        # Reset agent hidden state (DRQN)
         if use_recurrent:
             agent.reset_hidden()
 
@@ -142,8 +185,10 @@ def train_rl(mf_model, feedback_bundle, cold_split, action_pool,
         state_norm = normalize_state(state, running_mean, running_var)
 
         episode_rewards = []
-        episode_transitions = []  # for DRQN episode buffer
+        episode_transitions = []
         manager_reward_acc = 0.0
+        td_error_sum = 0.0
+        n_updates = 0
 
         done = False
         while not done:
@@ -159,8 +204,6 @@ def train_rl(mf_model, feedback_bundle, cold_split, action_pool,
                     state_norm, valid_actions, epsilon, mf_model, env.p_cold
                 )
                 action = (strategy_id, item_pool_idx)
-            elif use_recurrent:
-                action = agent.select_action(state_norm, valid_actions, epsilon)
             else:
                 action = agent.select_action(state_norm, valid_actions, epsilon)
 
@@ -170,22 +213,27 @@ def train_rl(mf_model, feedback_bundle, cold_split, action_pool,
 
             episode_rewards.append(reward)
 
+            # Normalize reward before storing (per interview size)
+            norm_reward = reward_normalizers[interview_size].normalize(reward)
+
             # ── Storage ───────────────────────────────────────────────────────
             if use_recurrent:
                 actual_action = int(action) if not isinstance(action, tuple) else action[1]
                 episode_transitions.append(
-                    (state_norm.copy(), actual_action, reward,
+                    (state_norm.copy(), actual_action, norm_reward,
                      next_state_norm.copy(), float(done))
                 )
             elif use_hier:
                 slot = top_k_cands.tolist().index(item_pool_idx) \
                     if item_pool_idx in top_k_cands else 0
                 agent.store_worker_transition(
-                    state_norm, slot, reward, next_state_norm, done, strategy_id
+                    state_norm, slot, norm_reward, next_state_norm, done, strategy_id
                 )
-                manager_reward_acc += reward
+                manager_reward_acc += norm_reward
             else:
-                buffer.push(state_norm, int(action), reward, next_state_norm, float(done))
+                current_buffer = replay_buffers[interview_size]
+                current_buffer.push(state_norm, int(action), norm_reward,
+                                    next_state_norm, float(done))
 
             # ── Training ──────────────────────────────────────────────────────
             if global_step >= steps_before_train:
@@ -197,6 +245,8 @@ def train_rl(mf_model, feedback_bundle, cold_split, action_pool,
                         w_loss, w_td = agent.update_worker(w_batch)
                         agent.worker_buffer.update_priorities(w_batch[6], np.abs(w_td))
                         agent.worker_buffer.anneal_beta()
+                        td_error_sum += float(np.abs(w_td).mean())
+                        n_updates += 1
 
                     if agent.should_update_manager() and len(agent.manager_buffer) >= batch_size:
                         m_batch = agent.manager_buffer.sample(batch_size)
@@ -204,11 +254,14 @@ def train_rl(mf_model, feedback_bundle, cold_split, action_pool,
                         agent.manager_buffer.update_priorities(m_batch[6], np.abs(m_td))
                         agent.manager_buffer.anneal_beta()
                 else:
-                    if len(buffer) >= batch_size:
-                        batch = buffer.sample(batch_size)
+                    current_buffer = replay_buffers[interview_size]
+                    if len(current_buffer) >= batch_size:
+                        batch = current_buffer.sample(batch_size)
                         loss, td_errors = agent.update(batch)
-                        buffer.update_priorities(batch[6], np.abs(td_errors))
-                        buffer.anneal_beta()
+                        current_buffer.update_priorities(batch[6], np.abs(td_errors))
+                        current_buffer.anneal_beta()
+                        td_error_sum += float(np.abs(td_errors).mean())
+                        n_updates += 1
 
             # ── Hierarchical manager transition storage ───────────────────────
             if use_hier and agent.should_update_manager():
@@ -226,12 +279,15 @@ def train_rl(mf_model, feedback_bundle, cold_split, action_pool,
                 loss, ep_td = agent.update(ep_batch)
                 buffer.update_episode_priorities(ep_batch[6], np.abs(ep_td))
                 buffer.anneal_beta()
+                td_error_sum += float(np.abs(ep_td).mean())
+                n_updates += 1
 
         if use_hier:
             agent.flush_manager_transition(state_norm, True)
 
         ep_rmse = info.get("rmse", float("nan"))
         ep_reward = sum(episode_rewards)
+        mean_td_error = td_error_sum / max(n_updates, 1)
 
         logger.log_episode({
             "episode": episode,
@@ -240,6 +296,7 @@ def train_rl(mf_model, feedback_bundle, cold_split, action_pool,
             "interview_size": interview_size,
             "epsilon": compute_epsilon(global_step, config),
             "global_step": global_step,
+            "mean_td_error": mean_td_error,
         })
 
         # ── Periodic evaluation ───────────────────────────────────────────────
@@ -254,7 +311,7 @@ def train_rl(mf_model, feedback_bundle, cold_split, action_pool,
 
             if eval_results.get("mean_rmse", float("inf")) < best_eval_rmse:
                 best_eval_rmse = eval_results["mean_rmse"]
-                ckpt_path = os.path.join(checkpoint_dir, f"best_agent.pt")
+                ckpt_path = os.path.join(checkpoint_dir, "best_agent.pt")
                 agent.save(ckpt_path)
                 logger.save_checkpoint_meta(ckpt_path)
 
@@ -266,7 +323,6 @@ def _quick_eval(agent, env, mf_model, finetuner, eval_cold_split,
                 action_pool, item_metadata, config, running_mean, running_var,
                 n_users=50):
     """Greedy evaluation on a subset of cold users."""
-    from models.matrix_factorization import ColdUserFinetuner
     use_recurrent = config.get("use_recurrent_dqn", False)
     use_hier = config.get("use_hierarchical_rl", False)
     is_quick = config.get("quick_test", False)

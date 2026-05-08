@@ -63,42 +63,21 @@ class ColdUserFinetuner:
         self.config = config
 
     def initialize_cold_vector(self, cold_user_items, all_item_ids=None):
-        """Initialize cold user vector as mean of top-K similar warm users' vectors.
+        """Initialize cold user vector as the mean of ALL warm user P vectors.
 
-        Similarity: cosine similarity between the mean item embedding of the
-        cold user's interaction set and each warm user's P vector.
-
-        Falls back to random initialization if similarity cannot be computed.
+        Using the global mean places the cold user at the centroid of the
+        learned latent space, which is a stable, scale-consistent starting
+        point regardless of how small the individual P/Q magnitudes are.
 
         Args:
             cold_user_items: list of item_ids the cold user has interacted with
-            all_item_ids: optional array of all warm user item indices (unused)
+            all_item_ids: unused (kept for API compatibility)
 
         Returns:
             (k,) torch.Tensor — initial cold user vector
         """
-        k = self.config["mf_latent_features"]
-        top_k = self.config.get("cold_init_top_k_similar", 5)
-
-        if len(cold_user_items) == 0:
-            return torch.randn(k) * 0.01
-
-        item_ids = torch.tensor(cold_user_items, dtype=torch.long)
-        valid = item_ids[item_ids < self.mf.Q.weight.shape[0]]
-        if len(valid) == 0:
-            return torch.randn(k) * 0.01
-
-        mean_item_vec = self.mf.Q.weight.data[valid].mean(dim=0)  # (k,)
-
         P = self.mf.get_all_user_vectors()  # (n_warm, k)
-        P_norm = F.normalize(P, dim=-1)
-        mean_norm = F.normalize(mean_item_vec.unsqueeze(0), dim=-1)
-        sims = (P_norm * mean_norm).sum(dim=-1)  # (n_warm,)
-
-        top_k_actual = min(top_k, P.shape[0])
-        top_indices = sims.topk(top_k_actual).indices
-        p_init = P[top_indices].mean(dim=0).clone()
-        return p_init
+        return P.mean(dim=0).clone()
 
     def finetune(self, p_cold_init, observed_items):
         """Optimize cold user vector against frozen item matrix.
@@ -130,6 +109,10 @@ class ColdUserFinetuner:
             p_cold = p_cold_init.clone().detach().requires_grad_(True)
             optimizer = torch.optim.Adam([p_cold], lr=lr)
 
+            prev_loss = float("inf")
+            patience = 10
+            no_improve = 0
+
             for _ in range(steps):
                 optimizer.zero_grad()
                 preds = gb + (p_cold.unsqueeze(0) * Q_frozen).sum(-1) + b_i_frozen
@@ -140,8 +123,17 @@ class ColdUserFinetuner:
                     loss = F.mse_loss(preds, ratings)
 
                 reg = lam * (p_cold ** 2).sum()
-                (loss + reg).backward()
+                total = loss + reg
+                total.backward()
                 optimizer.step()
+
+                if abs(prev_loss - total.item()) < 1e-7:
+                    no_improve += 1
+                    if no_improve >= patience:
+                        break
+                else:
+                    no_improve = 0
+                prev_loss = total.item()
 
             return p_cold.detach(), loss.item()
         else:
